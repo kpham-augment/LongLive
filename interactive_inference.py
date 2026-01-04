@@ -200,6 +200,7 @@ for i, batch_data in tqdm(enumerate(dataloader), disable=(local_rank != 0)):
         text_prompts_list=prompts_list,
         switch_frame_indices=switch_frame_indices,
         return_latents=False,
+        profile=getattr(config, "profile", False),
     )
 
     current_video = rearrange(video, "b t c h w -> b t h w c").cpu() * 255.0

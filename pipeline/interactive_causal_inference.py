@@ -103,6 +103,7 @@ class InteractiveCausalInferencePipeline(CausalInferencePipeline):
         switch_frame_indices: List[int],
         return_latents: bool = False,
         low_memory: bool = False,
+        profile: bool = False,
     ):
         """Generate a video and switch prompts at specified frame indices.
 
@@ -113,6 +114,7 @@ class InteractiveCausalInferencePipeline(CausalInferencePipeline):
                 we start using the prompts for segment i+1.
             return_latents: Whether to also return the latent tensor.
             low_memory: Enable low-memory mode.
+            profile: Whether to enable profiling and print timing information.
         """
         batch_size, num_output_frames, num_channels, height, width = noise.shape
         assert len(text_prompts_list) >= 1, "text_prompts_list must not be empty"
@@ -122,7 +124,24 @@ class InteractiveCausalInferencePipeline(CausalInferencePipeline):
         assert num_output_frames % self.num_frame_per_block == 0
         num_blocks = num_output_frames // self.num_frame_per_block
 
-        
+        # Set up profiling if requested
+        if profile:
+            init_start = torch.cuda.Event(enable_timing=True)
+            init_end = torch.cuda.Event(enable_timing=True)
+            diffusion_start = torch.cuda.Event(enable_timing=True)
+            diffusion_end = torch.cuda.Event(enable_timing=True)
+            vae_start = torch.cuda.Event(enable_timing=True)
+            vae_end = torch.cuda.Event(enable_timing=True)
+            block_times = []
+            block_start = torch.cuda.Event(enable_timing=True)
+            block_end = torch.cuda.Event(enable_timing=True)
+            # Track prompt switches
+            switch_times = []  # List of (switch_frame_idx, recache_time_ms, total_switch_time_ms)
+            switch_start = torch.cuda.Event(enable_timing=True)
+            recache_end = torch.cuda.Event(enable_timing=True)
+            switch_end = torch.cuda.Event(enable_timing=True)
+            init_start.record()
+
         # encode all prompts
         print(text_prompts_list)
         cond_list = [self.text_encoder(text_prompts=p) for p in text_prompts_list]
@@ -172,6 +191,11 @@ class InteractiveCausalInferencePipeline(CausalInferencePipeline):
         print(f"[inference] local_attn_size set on model: {self.generator.model.local_attn_size}")
         self._set_all_modules_max_attention_size(self.local_attn_size)
 
+        if profile:
+            init_end.record()
+            torch.cuda.synchronize()
+            diffusion_start.record()
+
         # temporal denoising by blocks
         all_num_frames = [self.num_frame_per_block] * num_blocks
         segment_idx = 0  # current segment index
@@ -186,9 +210,25 @@ class InteractiveCausalInferencePipeline(CausalInferencePipeline):
             print("[MultipleSwitch] switch_frame_indices", switch_frame_indices)
 
         for current_num_frames in all_num_frames:
+            if profile:
+                block_start.record()
+
+            # Track if we're switching prompts in this block
+            switched_in_this_block = False
             if next_switch_pos is not None and current_start_frame >= next_switch_pos:
+                # Start timing the prompt switch
+                if profile:
+                    switch_start.record()
+
+                switched_in_this_block = True
                 segment_idx += 1
                 self._recache_after_switch(output, current_start_frame, cond_list[segment_idx])
+
+                # Record end of recaching
+                if profile:
+                    recache_end.record()
+                    torch.cuda.synchronize()
+
                 if DEBUG:
                     print(
                         f"[MultipleSwitch] Switch to segment {segment_idx} at frame {current_start_frame}"
@@ -257,13 +297,99 @@ class InteractiveCausalInferencePipeline(CausalInferencePipeline):
                 current_start=current_start_frame * self.frame_seq_length,
             )
 
+            if profile:
+                block_end.record()
+                torch.cuda.synchronize()
+                block_time = block_start.elapsed_time(block_end)
+                block_times.append(block_time)
+
+                # If we switched in this block, record both recache and total switch latency
+                if switched_in_this_block:
+                    switch_end.record()
+                    torch.cuda.synchronize()
+                    recache_time = switch_start.elapsed_time(recache_end)
+                    total_switch_time = switch_start.elapsed_time(switch_end)
+                    switch_times.append((current_start_frame, recache_time, total_switch_time))
+
             # Update frame pointer
             current_start_frame += current_num_frames
+
+        if profile:
+            # End diffusion timing and synchronize CUDA
+            diffusion_end.record()
+            torch.cuda.synchronize()
+            diffusion_time = diffusion_start.elapsed_time(diffusion_end)
+            init_time = init_start.elapsed_time(init_end)
+            vae_start.record()
 
         # Standard decoding
         video = self.vae.decode_to_pixel(output.to(noise.device), use_cache=False)
         video = (video * 0.5 + 0.5).clamp(0, 1)
 
+        if profile:
+            # End VAE timing and synchronize CUDA
+            vae_end.record()
+            torch.cuda.synchronize()
+            vae_time = vae_start.elapsed_time(vae_end)
+            total_time = init_time + diffusion_time + vae_time
+
+            # Calculate inter-frame latency (steady-state)
+            # Exclude blocks where prompt switching occurred
+            switch_block_indices = set()
+            for switch_frame, _, _ in switch_times:
+                # Find which block this switch occurred in
+                block_idx = switch_frame // self.num_frame_per_block
+                switch_block_indices.add(block_idx)
+
+            # Get steady-state blocks (skip first block and switch blocks)
+            steady_state_blocks = [
+                bt for i, bt in enumerate(block_times[1:], start=1)
+                if i not in switch_block_indices
+            ]
+
+            if steady_state_blocks:
+                avg_block_time = sum(steady_state_blocks) / len(steady_state_blocks)
+                inter_frame_latency = avg_block_time / self.num_frame_per_block
+            elif len(block_times) > 1:
+                # Fallback: use all blocks except first
+                avg_block_time = sum(block_times[1:]) / len(block_times[1:])
+                inter_frame_latency = avg_block_time / self.num_frame_per_block
+            else:
+                avg_block_time = block_times[0] if block_times else 0
+                inter_frame_latency = avg_block_time / self.num_frame_per_block
+
+            print("Profiling results:")
+            print(f"  - Initialization/caching time: {init_time:.2f} ms ({100 * init_time / total_time:.2f}%)")
+            print(f"  - Diffusion generation time: {diffusion_time:.2f} ms ({100 * diffusion_time / total_time:.2f}%)")
+            for i, block_time in enumerate(block_times):
+                switch_marker = " [PROMPT SWITCH]" if i in switch_block_indices else ""
+                print(f"    - Block {i} generation time: {block_time:.2f} ms ({100 * block_time / diffusion_time:.2f}% of diffusion){switch_marker}")
+            print(f"  - VAE decoding time: {vae_time:.2f} ms ({100 * vae_time / total_time:.2f}%)")
+            print(f"  - Total time: {total_time:.2f} ms")
+
+            print(f"\n  Performance Metrics:")
+            print(f"  - Steady-state inter-frame latency: {inter_frame_latency:.2f} ms/frame")
+            print(f"    (avg block time: {avg_block_time:.2f} ms for {self.num_frame_per_block} frames, {len(steady_state_blocks)} steady-state blocks)")
+
+            if switch_times:
+                print(f"\n  Prompt Switch Latencies:")
+                for switch_frame, recache_time, total_time in switch_times:
+                    generation_time = total_time - recache_time
+                    print(f"    - Switch at frame {switch_frame}:")
+                    print(f"        Recache overhead: {recache_time:.2f} ms")
+                    print(f"        First block generation: {generation_time:.2f} ms")
+                    print(f"        Total switch latency: {total_time:.2f} ms")
+
+                avg_recache = sum(r for _, r, _ in switch_times) / len(switch_times)
+                avg_total = sum(t for _, _, t in switch_times) / len(switch_times)
+                avg_generation = avg_total - avg_recache
+
+                print(f"\n    Average Prompt-Switch Metrics:")
+                print(f"      - Recache overhead: {avg_recache:.2f} ms")
+                print(f"      - First block generation: {avg_generation:.2f} ms")
+                print(f"      - Total switch latency: {avg_total:.2f} ms")
+                print(f"      - Overhead vs steady-state block: {avg_total - avg_block_time:.2f} ms ({100 * (avg_total - avg_block_time) / avg_block_time:.1f}% slower)")
+
         if return_latents:
             return video, output
-        return video 
+        return video

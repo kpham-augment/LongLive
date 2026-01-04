@@ -1,4 +1,5 @@
 # Architecture
+profile: true
 denoising_step_list:
 - 1000
 - 750
@@ -16,7 +17,7 @@ model_kwargs:
 # Inference
 data_path: longlive_models/prompts/interactive_example.jsonl
 output_folder: videos/interactive
-inference_iter: -1
+inference_iter: 1
 num_output_frames: 240
 use_ema: false
 seed: 1

@@ -209,7 +209,7 @@ for i, batch_data in tqdm(enumerate(dataloader), disable=(local_rank != 0)):
         text_prompts=prompts,
         return_latents=True,
         low_memory=low_memory,
-        profile=False,
+        profile=getattr(config, "profile", False),
     )
     current_video = rearrange(video, 'b t c h w -> b t h w c').cpu()
     all_video.append(current_video)

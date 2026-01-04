@@ -226,6 +226,16 @@ class CausalInferencePipeline(torch.nn.Module):
             vae_time = vae_start.elapsed_time(vae_end)
             total_time = init_time + diffusion_time + vae_time
 
+            # Calculate inter-frame latency (steady-state)
+            # Use blocks after the first one to avoid initialization overhead
+            if len(block_times) > 1:
+                steady_state_blocks = block_times[1:]  # Skip first block
+                avg_block_time = sum(steady_state_blocks) / len(steady_state_blocks)
+                inter_frame_latency = avg_block_time / self.num_frame_per_block
+            else:
+                avg_block_time = block_times[0] if block_times else 0
+                inter_frame_latency = avg_block_time / self.num_frame_per_block
+
             print("Profiling results:")
             print(f"  - Initialization/caching time: {init_time:.2f} ms ({100 * init_time / total_time:.2f}%)")
             print(f"  - Diffusion generation time: {diffusion_time:.2f} ms ({100 * diffusion_time / total_time:.2f}%)")
@@ -233,6 +243,9 @@ class CausalInferencePipeline(torch.nn.Module):
                 print(f"    - Block {i} generation time: {block_time:.2f} ms ({100 * block_time / diffusion_time:.2f}% of diffusion)")
             print(f"  - VAE decoding time: {vae_time:.2f} ms ({100 * vae_time / total_time:.2f}%)")
             print(f"  - Total time: {total_time:.2f} ms")
+            print(f"\n  Performance Metrics:")
+            print(f"  - Steady-state inter-frame latency: {inter_frame_latency:.2f} ms/frame")
+            print(f"    (avg block time: {avg_block_time:.2f} ms for {self.num_frame_per_block} frames)")
 
         if return_latents:
             return video, output.to(noise.device)
