@@ -32,23 +32,29 @@ class InteractiveCausalInferencePipeline(CausalInferencePipeline):
 
     # Internal helpers
     def _recache_after_switch(self, output, current_start_frame, new_conditional_dict):
+        torch.cuda.nvtx.range_push("recache_after_switch")
         if not self.global_sink:
             # reset kv cache
+            torch.cuda.nvtx.range_push("kv_cache_reset")
             for block_idx in range(self.num_transformer_blocks):
                 cache = self.kv_cache1[block_idx]
                 cache["k"].zero_()
                 cache["v"].zero_()
                 # cache["global_end_index"].zero_()
                 # cache["local_end_index"].zero_()
-            
+            torch.cuda.nvtx.range_pop()
+
         # reset cross-attention cache
+        torch.cuda.nvtx.range_push("crossattn_cache_reset")
         for blk in self.crossattn_cache:
             blk["k"].zero_()
             blk["v"].zero_()
             blk["is_init"] = False
+        torch.cuda.nvtx.range_pop()
 
         # recache
         if current_start_frame == 0:
+            torch.cuda.nvtx.range_pop()
             return
         
         num_recache_frames = current_start_frame if self.local_attn_size == -1 else min(self.local_attn_size, current_start_frame)
@@ -88,12 +94,16 @@ class InteractiveCausalInferencePipeline(CausalInferencePipeline):
                 current_start=recache_start_frame * self.frame_seq_length,
                 sink_recache_after_switch=not self.global_sink,
             )
-        
+
         # reset cross-attention cache
+        torch.cuda.nvtx.range_push("crossattn_cache_reset")
         for blk in self.crossattn_cache:
             blk["k"].zero_()
             blk["v"].zero_()
             blk["is_init"] = False
+
+        torch.cuda.nvtx.range_pop()
+        torch.cuda.nvtx.range_pop()
 
     def inference(
         self,
@@ -144,7 +154,9 @@ class InteractiveCausalInferencePipeline(CausalInferencePipeline):
 
         # encode all prompts
         print(text_prompts_list)
+        torch.cuda.nvtx.range_push("text_encoder")
         cond_list = [self.text_encoder(text_prompts=p) for p in text_prompts_list]
+        torch.cuda.nvtx.range_pop()
 
         if low_memory:
             gpu_memory_preservation = get_cuda_free_memory_gb(gpu) + 5
@@ -174,17 +186,22 @@ class InteractiveCausalInferencePipeline(CausalInferencePipeline):
             kv_policy = "global (-1)"
         print(f"kv_cache_size: {kv_cache_size} (policy: {kv_policy}, frame_seq_length: {self.frame_seq_length}, num_output_frames: {num_output_frames})")
 
+        torch.cuda.nvtx.range_push("initialize_kv_cache")
         self._initialize_kv_cache(
             batch_size,
             dtype=noise.dtype,
             device=noise.device,
             kv_cache_size_override=kv_cache_size
         )
+        torch.cuda.nvtx.range_pop()
+
+        torch.cuda.nvtx.range_push("initialize_crossattn_cache")
         self._initialize_crossattn_cache(
             batch_size=batch_size,
             dtype=noise.dtype,
             device=noise.device
         )
+        torch.cuda.nvtx.range_pop()
 
         current_start_frame = 0
         self.generator.model.local_attn_size = self.local_attn_size
@@ -209,7 +226,9 @@ class InteractiveCausalInferencePipeline(CausalInferencePipeline):
             print("[MultipleSwitch] all_num_frames", all_num_frames)
             print("[MultipleSwitch] switch_frame_indices", switch_frame_indices)
 
+        block_idx = 0
         for current_num_frames in all_num_frames:
+            torch.cuda.nvtx.range_push(f"temporal_block_{block_idx}")
             if profile:
                 block_start.record()
 
@@ -222,7 +241,9 @@ class InteractiveCausalInferencePipeline(CausalInferencePipeline):
 
                 switched_in_this_block = True
                 segment_idx += 1
+                torch.cuda.nvtx.range_push(f"recache_after_switch_segment_{segment_idx}")
                 self._recache_after_switch(output, current_start_frame, cond_list[segment_idx])
+                torch.cuda.nvtx.range_pop()
 
                 # Record end of recaching
                 if profile:
@@ -247,7 +268,9 @@ class InteractiveCausalInferencePipeline(CausalInferencePipeline):
             ]
 
             # ---------------- Spatial denoising loop ----------------
+            torch.cuda.nvtx.range_push("spatial_denoising_loop")
             for index, current_timestep in enumerate(self.denoising_step_list):
+                torch.cuda.nvtx.range_push(f"denoising_step_{index}")
                 timestep = (
                     torch.ones([batch_size, current_num_frames],
                     device=noise.device,
@@ -256,6 +279,7 @@ class InteractiveCausalInferencePipeline(CausalInferencePipeline):
                 )
 
                 if index < len(self.denoising_step_list) - 1:
+                    torch.cuda.nvtx.range_push("generator_forward")
                     _, denoised_pred = self.generator(
                         noisy_image_or_video=noisy_input,
                         conditional_dict=cond_in_use,
@@ -264,6 +288,8 @@ class InteractiveCausalInferencePipeline(CausalInferencePipeline):
                         crossattn_cache=self.crossattn_cache,
                         current_start=current_start_frame * self.frame_seq_length,
                     )
+                    torch.cuda.nvtx.range_pop()
+                    torch.cuda.nvtx.range_push("add_noise")
                     next_timestep = self.denoising_step_list[index + 1]
                     noisy_input = self.scheduler.add_noise(
                         denoised_pred.flatten(0, 1),
@@ -273,7 +299,9 @@ class InteractiveCausalInferencePipeline(CausalInferencePipeline):
                             [batch_size * current_num_frames], device=noise.device, dtype=torch.long
                         ),
                     ).unflatten(0, denoised_pred.shape[:2])
+                    torch.cuda.nvtx.range_pop()
                 else:
+                    torch.cuda.nvtx.range_push("generator_forward")
                     _, denoised_pred = self.generator(
                         noisy_image_or_video=noisy_input,
                         conditional_dict=cond_in_use,
@@ -282,11 +310,15 @@ class InteractiveCausalInferencePipeline(CausalInferencePipeline):
                         crossattn_cache=self.crossattn_cache,
                         current_start=current_start_frame * self.frame_seq_length,
                     )
+                    torch.cuda.nvtx.range_pop()
+                torch.cuda.nvtx.range_pop()  # denoising_step
+            torch.cuda.nvtx.range_pop()  # spatial_denoising_loop
 
             # Record output
             output[:, current_start_frame : current_start_frame + current_num_frames] = denoised_pred.to(output.device)
 
             # rerun with clean context to update cache
+            torch.cuda.nvtx.range_push("clean_context_cache_update")
             context_timestep = torch.ones_like(timestep) * self.args.context_noise
             self.generator(
                 noisy_image_or_video=denoised_pred,
@@ -296,6 +328,7 @@ class InteractiveCausalInferencePipeline(CausalInferencePipeline):
                 crossattn_cache=self.crossattn_cache,
                 current_start=current_start_frame * self.frame_seq_length,
             )
+            torch.cuda.nvtx.range_pop()
 
             if profile:
                 block_end.record()
@@ -313,6 +346,8 @@ class InteractiveCausalInferencePipeline(CausalInferencePipeline):
 
             # Update frame pointer
             current_start_frame += current_num_frames
+            block_idx += 1
+            torch.cuda.nvtx.range_pop()  # temporal_block
 
         if profile:
             # End diffusion timing and synchronize CUDA
@@ -323,8 +358,10 @@ class InteractiveCausalInferencePipeline(CausalInferencePipeline):
             vae_start.record()
 
         # Standard decoding
+        torch.cuda.nvtx.range_push("vae_decode")
         video = self.vae.decode_to_pixel(output.to(noise.device), use_cache=False)
         video = (video * 0.5 + 0.5).clamp(0, 1)
+        torch.cuda.nvtx.range_pop()
 
         if profile:
             # End VAE timing and synchronize CUDA

@@ -72,6 +72,7 @@ else:
 
 
 low_memory = get_cuda_free_memory_gb(device) < 40
+print(f"low_memory: {low_memory}")
 torch.set_grad_enabled(False)
 
 pipeline = InteractiveCausalInferencePipeline(config, device=device)
@@ -168,9 +169,9 @@ if dist.is_initialized():
     sampler = DistributedSampler(dataset, shuffle=False, drop_last=True)
 else:
     sampler = SequentialSampler(dataset)
-
+    
 dataloader = DataLoader(dataset, batch_size=1, sampler=sampler, num_workers=0, drop_last=False)
-
+        
 # Create output directory
 if local_rank == 0:
     os.makedirs(config.output_folder, exist_ok=True)
@@ -179,7 +180,7 @@ if dist.is_initialized():
     dist.barrier()
 
 # ----------------------------- Inference loop -----------------------------
-for i, batch_data in tqdm(enumerate(dataloader), disable=(local_rank != 0)):
+for i, batch_data in tqdm(enumerate(dataloader), disable=(local_rank != 0), desc="Inference"):
     idx = batch_data["idx"].item()
     prompts_list: List[str] = batch_data["prompts_list"]  # type: ignore
 
@@ -194,7 +195,7 @@ for i, batch_data in tqdm(enumerate(dataloader), disable=(local_rank != 0)):
         device=device,
         dtype=torch.bfloat16,
     )
-
+    torch.cuda.profiler.start()
     video = pipeline.inference(
         noise=sampled_noise,
         text_prompts_list=prompts_list,
@@ -202,7 +203,8 @@ for i, batch_data in tqdm(enumerate(dataloader), disable=(local_rank != 0)):
         return_latents=False,
         profile=getattr(config, "profile", False),
     )
-
+    torch.cuda.profiler.stop()
+    
     current_video = rearrange(video, "b t c h w -> b t h w c").cpu() * 255.0
 
     if dist.is_initialized():

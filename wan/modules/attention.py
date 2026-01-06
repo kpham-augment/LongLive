@@ -10,14 +10,25 @@ try:
         device_name = torch.cuda.get_device_name(0).lower()
         return "h100" in device_name or "hopper" in device_name
     FLASH_ATTN_3_AVAILABLE = is_hopper_gpu()
+    if FLASH_ATTN_3_AVAILABLE:
+        print("Flash Attention 3 is available and will be used")
+    else:
+        print("Flash Attention 3 interface found but not using Hopper GPU")
 except ModuleNotFoundError:
     FLASH_ATTN_3_AVAILABLE = False
+    print("Flash Attention 3 is not available (module not found)")
 
 try:
     import flash_attn
     FLASH_ATTN_2_AVAILABLE = True
+    if not FLASH_ATTN_3_AVAILABLE:
+        print("Flash Attention 2 is available and will be used")
 except ModuleNotFoundError:
     FLASH_ATTN_2_AVAILABLE = False
+    print("Flash Attention 2 is not available (module not found)")
+
+if not FLASH_ATTN_2_AVAILABLE and not FLASH_ATTN_3_AVAILABLE:
+    print("No Flash Attention available, will fall back to torch.nn.functional.scaled_dot_product_attention")
 
 # FLASH_ATTN_3_AVAILABLE = False
 
@@ -101,6 +112,7 @@ def flash_attention(
     # apply attention
     if (version is None or version == 3) and FLASH_ATTN_3_AVAILABLE:
         # Note: dropout_p, window_size are not supported in FA3 now.
+        # FA3 returns the output tensor directly (not wrapped in a tuple like FA2)
         x = flash_attn_interface.flash_attn_varlen_func(
             q=q,
             k=k,
@@ -113,7 +125,7 @@ def flash_attention(
             max_seqlen_k=lk,
             softmax_scale=softmax_scale,
             causal=causal,
-            deterministic=deterministic)[0].unflatten(0, (b, lq))
+            deterministic=deterministic).unflatten(0, (b, lq))
     else:
         assert FLASH_ATTN_2_AVAILABLE
         x = flash_attn.flash_attn_varlen_func(

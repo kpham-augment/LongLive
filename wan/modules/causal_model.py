@@ -247,15 +247,18 @@ class CausalWanSelfAttention(nn.Module):
 
                 # Construct full k, v for attention computation (without modifying the original cache)
                 # Create temporary k, v for computation
+                torch.cuda.nvtx.range_push("kv_temp_clone")
                 temp_k = kv_cache["k"].clone()
                 temp_v = kv_cache["v"].clone()
-                
-                # Apply rolling update to the temporary cache
+                torch.cuda.nvtx.range_pop()
+
+                # Apply rolling update to the temporary cache + insert new tokens
+                torch.cuda.nvtx.range_push("kv_roll_and_insert")
                 temp_k[:, sink_tokens:sink_tokens + num_rolled_tokens] = \
                     temp_k[:, sink_tokens + num_evicted_tokens:sink_tokens + num_evicted_tokens + num_rolled_tokens].clone()
                 temp_v[:, sink_tokens:sink_tokens + num_rolled_tokens] = \
                     temp_v[:, sink_tokens + num_evicted_tokens:sink_tokens + num_evicted_tokens + num_rolled_tokens].clone()
-                
+
                 # Insert new key/value into the temporary cache
                 # Protect sink_tokens only during recomputation; regular forward generation allows writing into the initial sink region
                 write_start_index = max(local_start_index, sink_tokens) if is_recompute else local_start_index
@@ -264,6 +267,8 @@ class CausalWanSelfAttention(nn.Module):
                 if write_len > 0:
                     temp_k[:, write_start_index:local_end_index] = roped_key[:, roped_offset:roped_offset + write_len]
                     temp_v[:, write_start_index:local_end_index] = v[:, roped_offset:roped_offset + write_len]
+
+                torch.cuda.nvtx.range_pop()
 
                 # Save cache update info for later use
                 cache_update_info = {
@@ -289,17 +294,22 @@ class CausalWanSelfAttention(nn.Module):
                 local_start_index = local_end_index - num_new_tokens
 
                 # Construct full k, v for attention computation (without modifying the original cache)
+                torch.cuda.nvtx.range_push("kv_temp_clone")
                 temp_k = kv_cache["k"].clone()
                 temp_v = kv_cache["v"].clone()
+                torch.cuda.nvtx.range_pop()
                 # Protect sink_tokens only during recomputation; regular forward generation allows writing into the initial sink region
                 write_start_index = max(local_start_index, sink_tokens) if is_recompute else local_start_index
                 if sink_recache_after_switch:
                     write_start_index = local_start_index
                 roped_offset = max(0, write_start_index - local_start_index)
                 write_len = max(0, local_end_index - write_start_index)
+
+                torch.cuda.nvtx.range_push("kv_direct_insert")
                 if write_len > 0:
                     temp_k[:, write_start_index:local_end_index] = roped_key[:, roped_offset:roped_offset + write_len]
                     temp_v[:, write_start_index:local_end_index] = v[:, roped_offset:roped_offset + write_len]
+                torch.cuda.nvtx.range_pop()
 
                 # Save cache update info for later use
                 cache_update_info = {
@@ -329,8 +339,10 @@ class CausalWanSelfAttention(nn.Module):
                     local_start_for_window = max(sink_tokens, local_end_index - local_budget)
                     k_local = temp_k[:, local_start_for_window:local_end_index]
                     v_local = temp_v[:, local_start_for_window:local_end_index]
+                    torch.cuda.nvtx.range_push("kv_sink_concat")
                     k_cat = torch.cat([k_sink, k_local], dim=1)
                     v_cat = torch.cat([v_sink, v_local], dim=1)
+                    torch.cuda.nvtx.range_pop()
                 else:
                     k_cat = k_sink
                     v_cat = v_sink
@@ -841,6 +853,7 @@ class CausalWanModel(ModelMixin, ConfigMixin):
             kv_cache: List of cache dictionaries for each block
             cache_update_infos: List of (block_index, cache_update_info) tuples
         """
+        torch.cuda.nvtx.range_push("_apply_cache_updates")
         for block_index, (current_end, local_end_index, update_info) in cache_update_infos:
             if update_info is not None:
                 cache = kv_cache[block_index]
@@ -856,17 +869,18 @@ class CausalWanModel(ModelMixin, ConfigMixin):
                     write_end_index = update_info.get("write_end_index", local_end_index)
                     new_k = update_info["new_k"]
                     new_v = update_info["new_v"]
-                    
+                    torch.cuda.nvtx.range_push("kv_roll_and_insert")
                     # Perform the rolling operation
                     cache["k"][:, sink_tokens:sink_tokens + num_rolled_tokens] = \
                         cache["k"][:, sink_tokens + num_evicted_tokens:sink_tokens + num_evicted_tokens + num_rolled_tokens].clone()
                     cache["v"][:, sink_tokens:sink_tokens + num_rolled_tokens] = \
                         cache["v"][:, sink_tokens + num_evicted_tokens:sink_tokens + num_evicted_tokens + num_rolled_tokens].clone()
-                    
+
                     # Insert new key/value
                     if write_end_index > write_start_index and new_k.shape[1] == (write_end_index - write_start_index):
                         cache["k"][:, write_start_index:write_end_index] = new_k
                         cache["v"][:, write_start_index:write_end_index] = new_v
+                    torch.cuda.nvtx.range_pop()
                     
                 elif update_info["action"] == "direct_insert":
                     # Direct insert
@@ -876,17 +890,19 @@ class CausalWanModel(ModelMixin, ConfigMixin):
                     write_end_index = update_info.get("write_end_index", local_end_index)
                     new_k = update_info["new_k"]
                     new_v = update_info["new_v"]
-                    
+                    torch.cuda.nvtx.range_push("kv_direct_insert")
                     # Insert new key/value
                     if write_end_index > write_start_index and new_k.shape[1] == (write_end_index - write_start_index):
                         cache["k"][:, write_start_index:write_end_index] = new_k
                         cache["v"][:, write_start_index:write_end_index] = new_v
+                    torch.cuda.nvtx.range_pop()
             
             # Update indices: do not roll back pointers during recomputation
             is_recompute = False if update_info is None else update_info.get("is_recompute", False)
             if not is_recompute:
                 kv_cache[block_index]["global_end_index"].fill_(current_end)
                 kv_cache[block_index]["local_end_index"].fill_(local_end_index)
+        torch.cuda.nvtx.range_pop()
 
     def _forward_inference(
         self,
@@ -996,6 +1012,7 @@ class CausalWanModel(ModelMixin, ConfigMixin):
         cache_update_info = None
         cache_update_infos = []  # Collect cache update info for all blocks
         for block_index, block in enumerate(self.blocks):
+            torch.cuda.nvtx.range_push(f"transformer_block_{block_index}")
             # print(f"block_index: {block_index}")
             if torch.is_grad_enabled() and self.gradient_checkpointing:
                 kwargs.update(
@@ -1038,6 +1055,7 @@ class CausalWanModel(ModelMixin, ConfigMixin):
                     cache_update_info = block_cache_update_info[:2]  # (current_end, local_end_index)
                 else:
                     x = result
+            torch.cuda.nvtx.range_pop()  # transformer_block
         # log_gpu_memory(f"in _forward_inference: {x[0].device}")
         # After all blocks are processed, apply cache updates in a single pass
         if kv_cache is not None and cache_update_infos:
