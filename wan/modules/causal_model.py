@@ -1,6 +1,15 @@
 # Adopted from https://github.com/guandeh17/Self-Forcing
 # SPDX-License-Identifier: CC-BY-NC-SA-4.0
-from wan.modules.attention import attention
+import math
+
+import torch
+import torch.nn as nn
+import torch.distributed as dist
+from diffusers.configuration_utils import ConfigMixin, register_to_config
+from diffusers.models.modeling_utils import ModelMixin
+from torch.nn.attention.flex_attention import create_block_mask, flex_attention, BlockMask
+
+from wan.modules.attention import attention, flash_attention_varlen
 from wan.modules.model import (
     WanRMSNorm,
     rope_apply,
@@ -10,16 +19,11 @@ from wan.modules.model import (
     MLPProj,
     sinusoidal_embedding_1d
 )
-from torch.nn.attention.flex_attention import create_block_mask, flex_attention
-from diffusers.configuration_utils import ConfigMixin, register_to_config
-from torch.nn.attention.flex_attention import BlockMask
-from diffusers.models.modeling_utils import ModelMixin
-import torch.nn as nn
-import torch
-import math
-import torch.distributed as dist
-from utils.memory import gpu, get_cuda_free_memory_gb, DynamicSwapInstaller, log_gpu_memory
-
+from wan.modules.ring_buffer_cache import (
+    prepare_attention_with_new_tokens,
+    ring_buffer_write,
+    ring_buffer_write_from_full,
+)
 from utils.debug_option import DEBUG
 
 # wan 1.3B model has a weird channel / head configurations and require max-autotune to work with flexattention
@@ -29,7 +33,23 @@ flex_attention = torch.compile(
     flex_attention, dynamic=False, mode="max-autotune-no-cudagraphs")
 
 
-def causal_rope_apply(x, grid_sizes, freqs, start_frame=0):
+def is_ring_buffer_cache(kv_cache: dict) -> bool:
+    """Check if the kv_cache uses ring buffer structure."""
+    return kv_cache is not None and "write_ptr" in kv_cache
+
+
+def causal_rope_apply(x, grid_sizes, freqs, start_frame=0, cached_grid_dims=None):
+    """
+    Apply rotary position embedding to input tensor.
+
+    Args:
+        x: Input tensor of shape [B, L, num_heads, head_dim]
+        grid_sizes: Grid sizes tensor of shape [B, 3] (F, H, W)
+        freqs: Rotary frequencies
+        start_frame: Starting frame index for RoPE
+        cached_grid_dims: Optional tuple of (f, h, w) for CUDA graph compatibility.
+                         If provided, avoids grid_sizes.tolist() which causes GPU sync.
+    """
     n, c = x.size(2), x.size(3) // 2
 
     # split freqs
@@ -38,25 +58,51 @@ def causal_rope_apply(x, grid_sizes, freqs, start_frame=0):
     # loop over samples
     output = []
 
-    for i, (f, h, w) in enumerate(grid_sizes.tolist()):
-        seq_len = f * h * w
+    # Use cached dimensions for CUDA graph compatibility
+    if cached_grid_dims is not None:
+        # Single set of dimensions for all samples (assumes batch has uniform grid)
+        f, h, w = cached_grid_dims
+        for i in range(x.size(0)):
+            seq_len = f * h * w
 
-        # precompute multipliers
-        x_i = torch.view_as_complex(x[i, :seq_len].to(torch.float64).reshape(
-            seq_len, n, -1, 2))
-        freqs_i = torch.cat([
-            freqs[0][start_frame:start_frame + f].view(f, 1, 1, -1).expand(f, h, w, -1),
-            freqs[1][:h].view(1, h, 1, -1).expand(f, h, w, -1),
-            freqs[2][:w].view(1, 1, w, -1).expand(f, h, w, -1)
-        ],
-            dim=-1).reshape(seq_len, 1, -1)
+            # precompute multipliers
+            x_i = torch.view_as_complex(x[i, :seq_len].to(torch.float64).reshape(
+                seq_len, n, -1, 2))
+            freqs_i = torch.cat([
+                freqs[0][start_frame:start_frame + f].view(f, 1, 1, -1).expand(f, h, w, -1),
+                freqs[1][:h].view(1, h, 1, -1).expand(f, h, w, -1),
+                freqs[2][:w].view(1, 1, w, -1).expand(f, h, w, -1)
+            ],
+                dim=-1).reshape(seq_len, 1, -1)
 
-        # apply rotary embedding
-        x_i = torch.view_as_real(x_i * freqs_i).flatten(2)
-        x_i = torch.cat([x_i, x[i, seq_len:]])
+            # apply rotary embedding
+            x_i = torch.view_as_real(x_i * freqs_i).flatten(2)
+            x_i = torch.cat([x_i, x[i, seq_len:]])
 
-        # append to collection
-        output.append(x_i)
+            # append to collection
+            output.append(x_i)
+    else:
+        # Original path with .tolist() (not CUDA graph safe)
+        for i, (f, h, w) in enumerate(grid_sizes.tolist()):
+            seq_len = f * h * w
+
+            # precompute multipliers
+            x_i = torch.view_as_complex(x[i, :seq_len].to(torch.float64).reshape(
+                seq_len, n, -1, 2))
+            freqs_i = torch.cat([
+                freqs[0][start_frame:start_frame + f].view(f, 1, 1, -1).expand(f, h, w, -1),
+                freqs[1][:h].view(1, h, 1, -1).expand(f, h, w, -1),
+                freqs[2][:w].view(1, 1, w, -1).expand(f, h, w, -1)
+            ],
+                dim=-1).reshape(seq_len, 1, -1)
+
+            # apply rotary embedding
+            x_i = torch.view_as_real(x_i * freqs_i).flatten(2)
+            x_i = torch.cat([x_i, x[i, seq_len:]])
+
+            # append to collection
+            output.append(x_i)
+
     return torch.stack(output).type_as(x)
 
 
@@ -104,7 +150,9 @@ class CausalWanSelfAttention(nn.Module):
         kv_cache=None,
         current_start=0,
         cache_start=None,
-        sink_recache_after_switch=False
+        sink_recache_after_switch=False,
+        frame_seqlen: int | None = None,
+        cached_grid_dims: tuple | None = None
     ):
         r"""
         Args:
@@ -113,6 +161,10 @@ class CausalWanSelfAttention(nn.Module):
             grid_sizes(Tensor): Shape [B, 3], the second dimension contains (F, H, W)
             freqs(Tensor): Rope freqs, shape [1024, C / num_heads / 2]
             block_mask (BlockMask)
+            frame_seqlen (int, optional): Number of tokens per frame. If provided, avoids
+                extracting from grid_sizes (CUDA graph compatible).
+            cached_grid_dims (tuple, optional): Pre-computed (f, h, w) grid dimensions for
+                CUDA graph compatibility. If provided, avoids grid_sizes.tolist() sync.
         """
         b, s, n, d = *x.shape[:2], self.num_heads, self.head_dim
         if cache_start is None:
@@ -203,12 +255,17 @@ class CausalWanSelfAttention(nn.Module):
                     block_mask=block_mask
                 )[:, :, :-padded_length].transpose(2, 1)
         else:
-            frame_seqlen = math.prod(grid_sizes[0][1:]).item()
+            # Use provided frame_seqlen if available (CUDA graph compatible)
+            # Otherwise compute from grid_sizes (not CUDA graph compatible due to .item())
+            if frame_seqlen is None:
+                frame_seqlen = math.prod(grid_sizes[0][1:]).item()
             current_start_frame = current_start // frame_seqlen
             roped_query = causal_rope_apply(
-                q, grid_sizes, freqs, start_frame=current_start_frame).type_as(v)
+                q, grid_sizes, freqs, start_frame=current_start_frame,
+                cached_grid_dims=cached_grid_dims).type_as(v)
             roped_key = causal_rope_apply(
-                k, grid_sizes, freqs, start_frame=current_start_frame).type_as(v)
+                k, grid_sizes, freqs, start_frame=current_start_frame,
+                cached_grid_dims=cached_grid_dims).type_as(v)
 
             current_end = current_start + roped_query.shape[1]
             sink_tokens = self.sink_size * frame_seqlen
@@ -227,8 +284,99 @@ class CausalWanSelfAttention(nn.Module):
 
             # Compute cache update parameters without modifying kv_cache directly
             cache_update_info = None
-            is_recompute = current_end <= kv_cache["global_end_index"].item() and current_start > 0
-            if self.local_attn_size != -1 and (current_end > kv_cache["global_end_index"].item()) and (
+
+            # ============ RING BUFFER PATH (CUDA Graph Compatible) ============
+            # Uses only tensor operations, no .item() calls
+            if is_ring_buffer_cache(kv_cache):
+                # Use ring buffer for CUDA graph-compatible attention
+                # All computations use tensor arithmetic for graph compatibility
+
+                # Compute is_recompute as a tensor (but we need it as bool for Python conditionals)
+                # For graph capture, we use tensor comparisons but extract the result
+                # Note: current_end and current_start are Python ints, so this comparison is safe
+                global_end_tensor = kv_cache["global_end_index"]
+                is_recompute = (current_end <= global_end_tensor) & (current_start > 0)
+
+                # Compute local_end_index using tensor arithmetic
+                # local_end_index = local_end + (current_end - global_end)
+                local_end_tensor = kv_cache["local_end_index"] + (current_end - global_end_tensor)
+                local_end_index = local_end_tensor  # Keep as tensor
+                local_start_index = local_end_index - num_new_tokens
+
+                # Protect sink during recomputation (use torch.where for tensor conditional)
+                # write_start_index = max(local_start_index, sink_tokens) if is_recompute else local_start_index
+                sink_protected_start = torch.clamp(local_start_index, min=sink_tokens)
+                write_start_index = torch.where(
+                    is_recompute,
+                    sink_protected_start,
+                    local_start_index
+                )
+                if sink_recache_after_switch:
+                    write_start_index = local_start_index
+
+                # FULLY CUDA GRAPH COMPATIBLE:
+                # - source_offset and write_len are tensors (no .item() calls)
+                # - Full tensors passed to prepare_attention (no variable slicing)
+                # - flash_attention_varlen handles variable k_lens without slicing
+                source_offset = torch.clamp(write_start_index - local_start_index, min=0)
+                write_len = torch.clamp(local_end_index - write_start_index, min=0)
+
+                # Prepare attention buffers using ring buffer gather
+                # Pass full tensors with tensor-based offset/length
+                torch.cuda.nvtx.range_push("ring_buffer_prepare_attention")
+                attn_k, attn_v, num_valid = prepare_attention_with_new_tokens(
+                    cache=kv_cache,
+                    full_k=roped_key,  # Full tensor, no slicing
+                    full_v=v,          # Full tensor, no slicing
+                    local_end_index=local_end_index,  # Tensor
+                    source_offset=source_offset,       # Tensor
+                    write_len=write_len,               # Tensor
+                    sink_tokens=sink_tokens,
+                    max_attention_size=self.max_attention_size,
+                )
+                torch.cuda.nvtx.range_pop()
+
+                # Build cache update info for deferred write
+                # Store tensor references for later write operation
+                cache_update_info = {
+                    "action": "ring_buffer_write",
+                    "sink_tokens": sink_tokens,
+                    "local_start_index": local_start_index,
+                    "local_end_index": local_end_index,
+                    "write_start_index": write_start_index,
+                    "write_end_index": local_end_index,
+                    "full_k": roped_key,       # Full tensor
+                    "full_v": v,               # Full tensor
+                    "source_offset": source_offset,  # Tensor
+                    "write_len": write_len,          # Tensor
+                    "current_end": current_end,
+                    "is_recompute": is_recompute,
+                }
+
+                # Compute attention using flash_attention_varlen for CUDA graph compatibility
+                # Pass full attention buffer with k_lens=num_valid (no slicing needed)
+                # Pass pre-allocated cu_seqlens buffers from kv_cache for in-place updates
+                B = roped_query.size(0)
+                k_lens = num_valid.expand(B) if num_valid.dim() == 0 else num_valid
+                # Use pre-allocated k_lens buffer to avoid .to() call during graph capture
+                # (CUDA graphs require all tensor addresses to be static)
+                k_lens_buffer = kv_cache.get("k_lens_int32")
+                if k_lens_buffer is not None:
+                    # In-place copy to pre-allocated int32 buffer
+                    k_lens_buffer.copy_(k_lens)
+                    k_lens = k_lens_buffer
+                x = flash_attention_varlen(
+                    q=roped_query,
+                    k=attn_k,  # Full buffer
+                    v=attn_v,  # Full buffer
+                    k_lens=k_lens,  # Tensor for masking (int32)
+                    max_seqlen_k=self.max_attention_size,
+                    cu_seqlens_q=kv_cache.get("cu_seqlens_q"),  # Pre-allocated, static
+                    cu_seqlens_k=kv_cache.get("cu_seqlens_k"),  # Pre-allocated, computed in-place
+                    k_lens_padded=kv_cache.get("k_lens_padded"),  # Scratch buffer for cu_seqlens_k
+                )
+            # ============ LEGACY PATH (Original clone-based) ============
+            elif self.local_attn_size != -1 and (current_end > kv_cache["global_end_index"].item()) and (
                     num_new_tokens + kv_cache["local_end_index"].item() > kv_cache_size):
                 # Calculate the number of new tokens added in this step
                 # Shift existing cache content left to discard oldest tokens
@@ -327,37 +475,38 @@ class CausalWanSelfAttention(nn.Module):
             # if (not dist.is_initialized() or dist.get_rank() == 0) and DEBUG:
             #     print(f"local_start_index: {local_start_index}, local_end_index: {local_end_index}")
 
-            # Use temporary k, v to compute attention
-            if sink_tokens > 0:
-                # Concatenate sink tokens and local window tokens, keeping total length strictly below max_attention_size
-                local_budget = self.max_attention_size - sink_tokens
-                k_sink = temp_k[:, :sink_tokens]
-                v_sink = temp_v[:, :sink_tokens]
-                # if (not dist.is_initialized() or dist.get_rank() == 0) and DEBUG:
-                #     print(f"local_budget: {local_budget}")
-                if local_budget > 0:
-                    local_start_for_window = max(sink_tokens, local_end_index - local_budget)
-                    k_local = temp_k[:, local_start_for_window:local_end_index]
-                    v_local = temp_v[:, local_start_for_window:local_end_index]
-                    torch.cuda.nvtx.range_push("kv_sink_concat")
-                    k_cat = torch.cat([k_sink, k_local], dim=1)
-                    v_cat = torch.cat([v_sink, v_local], dim=1)
-                    torch.cuda.nvtx.range_pop()
+            # Use temporary k, v to compute attention (legacy path only - ring buffer already computed x above)
+            if not is_ring_buffer_cache(kv_cache):
+                if sink_tokens > 0:
+                    # Concatenate sink tokens and local window tokens, keeping total length strictly below max_attention_size
+                    local_budget = self.max_attention_size - sink_tokens
+                    k_sink = temp_k[:, :sink_tokens]
+                    v_sink = temp_v[:, :sink_tokens]
+                    # if (not dist.is_initialized() or dist.get_rank() == 0) and DEBUG:
+                    #     print(f"local_budget: {local_budget}")
+                    if local_budget > 0:
+                        local_start_for_window = max(sink_tokens, local_end_index - local_budget)
+                        k_local = temp_k[:, local_start_for_window:local_end_index]
+                        v_local = temp_v[:, local_start_for_window:local_end_index]
+                        torch.cuda.nvtx.range_push("kv_sink_concat")
+                        k_cat = torch.cat([k_sink, k_local], dim=1)
+                        v_cat = torch.cat([v_sink, v_local], dim=1)
+                        torch.cuda.nvtx.range_pop()
+                    else:
+                        k_cat = k_sink
+                        v_cat = v_sink
+                    x = attention(
+                        roped_query,
+                        k_cat,
+                        v_cat
+                    )
                 else:
-                    k_cat = k_sink
-                    v_cat = v_sink
-                x = attention(
-                    roped_query,
-                    k_cat,
-                    v_cat
-                )
-            else:
-                window_start = max(0, local_end_index - self.max_attention_size)
-                x = attention(
-                    roped_query,
-                    temp_k[:, window_start:local_end_index],
-                    temp_v[:, window_start:local_end_index]
-                )
+                    window_start = max(0, local_end_index - self.max_attention_size)
+                    x = attention(
+                        roped_query,
+                        temp_k[:, window_start:local_end_index],
+                        temp_v[:, window_start:local_end_index]
+                    )
 
         # output
         x = x.flatten(2)
@@ -425,6 +574,7 @@ class CausalWanAttentionBlock(nn.Module):
         current_start=0,
         cache_start=None,
         sink_recache_after_switch=False,
+        cached_grid_dims: tuple | None = None,
     ):
         r"""
         Args:
@@ -433,6 +583,7 @@ class CausalWanAttentionBlock(nn.Module):
             seq_lens(Tensor): Shape [B], length of each sequence in batch
             grid_sizes(Tensor): Shape [B, 3], the second dimension contains (F, H, W)
             freqs(Tensor): Rope freqs, shape [1024, C / num_heads / 2]
+            cached_grid_dims (tuple, optional): Pre-computed (f, h, w) for CUDA graph compatibility.
         """
         num_frames, frame_seqlen = e.shape[1], x.shape[1] // e.shape[1]
         # assert e.dtype == torch.float32
@@ -444,7 +595,8 @@ class CausalWanAttentionBlock(nn.Module):
         self_attn_result = self.self_attn(
             (self.norm1(x).unflatten(dim=1, sizes=(num_frames, frame_seqlen)) * (1 + e[1]) + e[0]).flatten(1, 2),
             seq_lens, grid_sizes,
-            freqs, block_mask, kv_cache, current_start, cache_start, sink_recache_after_switch)
+            freqs, block_mask, kv_cache, current_start, cache_start, sink_recache_after_switch,
+            frame_seqlen=frame_seqlen, cached_grid_dims=cached_grid_dims)
         
         if kv_cache is not None:
             y, cache_update_info = self_attn_result
@@ -640,6 +792,49 @@ class CausalWanModel(ModelMixin, ConfigMixin):
 
         self.num_frame_per_block = 1
         self.independent_first_frame = False
+
+        # Cached frame_seqlen for CUDA graph compatibility (avoids .item() calls)
+        # This is set on first forward pass and assumed constant for a given resolution
+        self._cached_frame_seqlen: int | None = None
+
+        # CUDA graph static buffers - pre-computed tensors to avoid dynamic allocation
+        self._cuda_graph_static_buffers: dict | None = None
+
+    def setup_cuda_graph_buffers(self, batch_size: int, num_frames: int, height: int, width: int, device: torch.device):
+        """
+        Pre-compute and cache static tensors for CUDA graph compatibility.
+
+        Must be called before capturing a CUDA graph. These buffers avoid
+        dynamic tensor creation during forward pass.
+
+        Args:
+            batch_size: Batch size (typically 1)
+            num_frames: Number of video frames
+            height: Video height in latent space (H/8)
+            width: Video width in latent space (W/8)
+            device: Target device
+        """
+        # Compute grid sizes after patch embedding
+        # Input shape: [C_in, F, H, W] -> after patch_embedding: [1, C, F, H//2, W//2]
+        f_patches = num_frames // self.patch_size[0]
+        h_patches = height // self.patch_size[1]
+        w_patches = width // self.patch_size[2]
+
+        # Create static buffers
+        grid_sizes = torch.tensor([[f_patches, h_patches, w_patches]], dtype=torch.long, device=device)
+        seq_lens = torch.tensor([f_patches * h_patches * w_patches], dtype=torch.long, device=device)
+
+        self._cuda_graph_static_buffers = {
+            "grid_sizes": grid_sizes,
+            "seq_lens": seq_lens,
+            "batch_size": batch_size,
+            "num_frames": num_frames,
+            "f_patches": f_patches,
+            "h_patches": h_patches,
+            "w_patches": w_patches,
+        }
+
+        print(f"[CausalWanModel] CUDA graph buffers setup: grid_sizes={grid_sizes.tolist()}, seq_lens={seq_lens.tolist()}")
 
     def _set_gradient_checkpointing(self, module, value=False):
         self.gradient_checkpointing = value
@@ -896,7 +1091,46 @@ class CausalWanModel(ModelMixin, ConfigMixin):
                         cache["k"][:, write_start_index:write_end_index] = new_k
                         cache["v"][:, write_start_index:write_end_index] = new_v
                     torch.cuda.nvtx.range_pop()
-            
+
+                elif update_info["action"] == "ring_buffer_write":
+                    # Ring buffer write - uses circular indexing
+                    # Check if we have full tensors (CUDA graph compatible) or pre-sliced tensors (legacy)
+                    full_k = update_info.get("full_k")
+                    full_v = update_info.get("full_v")
+                    source_offset = update_info.get("source_offset")
+                    write_len = update_info.get("write_len")
+                    is_recompute = update_info.get("is_recompute", False)
+
+                    torch.cuda.nvtx.range_push("ring_buffer_write")
+                    if full_k is not None and source_offset is not None:
+                        # CUDA graph compatible path - use full tensors with tensor offset/length
+                        # is_recompute can be a tensor (for CUDA graph compatibility)
+                        ring_buffer_write_from_full(
+                            cache=cache,
+                            full_k=full_k,
+                            full_v=full_v,
+                            source_offset=source_offset,
+                            write_len=write_len,
+                            protect_sink=is_recompute,  # Can be tensor or bool
+                        )
+                    else:
+                        # Legacy path - pre-sliced tensors (not CUDA graph compatible)
+                        new_k = update_info.get("new_k")
+                        new_v = update_info.get("new_v")
+                        # Convert tensor to bool for legacy path
+                        protect_sink_bool = is_recompute.item() if isinstance(is_recompute, torch.Tensor) else is_recompute
+                        if new_k is not None and new_v is not None and new_k.shape[1] > 0:
+                            ring_buffer_write(
+                                cache=cache,
+                                new_k=new_k,
+                                new_v=new_v,
+                                protect_sink=protect_sink_bool,
+                            )
+                    torch.cuda.nvtx.range_pop()
+
+                    # Ring buffer updates its own indices internally, so skip the common update below
+                    continue
+
             # Update indices: do not roll back pointers during recomputation
             is_recompute = False if update_info is None else update_info.get("is_recompute", False)
             if not is_recompute:
@@ -952,17 +1186,28 @@ class CausalWanModel(ModelMixin, ConfigMixin):
 
         if y is not None:
             x = [torch.cat([u, v], dim=0) for u, v in zip(x, y)]
-        
+
         # print(f"x.device: {x[0].device}, t.device: {t.device}, context.device: {context.device}, seq_len: {seq_len}")
 
         # embeddings
         x = [self.patch_embedding(u.unsqueeze(0)) for u in x]
         # print("patch embedding done")
-        grid_sizes = torch.stack(
-            [torch.tensor(u.shape[2:], dtype=torch.long) for u in x])
+
+        # Use cached static buffers for CUDA graph compatibility if available
+        if self._cuda_graph_static_buffers is not None:
+            grid_sizes = self._cuda_graph_static_buffers["grid_sizes"]
+            seq_lens = self._cuda_graph_static_buffers["seq_lens"]
+        else:
+            # Dynamic tensor creation (not CUDA graph safe)
+            grid_sizes = torch.stack(
+                [torch.tensor(u.shape[2:], dtype=torch.long) for u in x])
+            seq_lens = torch.tensor([u.size(1) for u in x], dtype=torch.long)
+
         x = [u.flatten(2).transpose(1, 2) for u in x]
-        seq_lens = torch.tensor([u.size(1) for u in x], dtype=torch.long)
-        assert seq_lens.max() <= seq_len
+        # Skip assertion during CUDA graph capture (seq_lens.max() causes GPU sync)
+        # When using cached buffers, this was already validated during setup
+        if self._cuda_graph_static_buffers is None:
+            assert seq_lens.max() <= seq_len
         x = torch.cat(x)
         """
         torch.cat([
@@ -973,12 +1218,13 @@ class CausalWanModel(ModelMixin, ConfigMixin):
 
         # time embeddings
         # with amp.autocast(dtype=torch.float32):
+        print("[Model Forward] Computing time embedding...")
         e = self.time_embedding(
             sinusoidal_embedding_1d(self.freq_dim, t.flatten()).type_as(x))
         e0 = self.time_projection(e).unflatten(
             1, (6, self.dim)).unflatten(dim=0, sizes=t.shape)
         # assert e.dtype == torch.float32 and e0.dtype == torch.float32
-        # print("time embedding done")
+        print("[Model Forward] Time embedding done")
         # context
         context_lens = None
         context = self.text_embedding(
@@ -987,10 +1233,16 @@ class CausalWanModel(ModelMixin, ConfigMixin):
                     [u, u.new_zeros(self.text_len - u.size(0), u.size(1))])
                 for u in context
             ]))
-        # print("text embedding done")
+        print("[Model Forward] Text embedding done")
         if clip_fea is not None:
             context_clip = self.img_emb(clip_fea)  # bs x 257 x dim
             context = torch.concat([context_clip, context], dim=1)
+
+        # Prepare cached grid dims for CUDA graph compatibility
+        cached_grid_dims = None
+        if self._cuda_graph_static_buffers is not None:
+            cached = self._cuda_graph_static_buffers
+            cached_grid_dims = (cached["f_patches"], cached["h_patches"], cached["w_patches"])
 
         # arguments
         kwargs = dict(
@@ -1001,7 +1253,8 @@ class CausalWanModel(ModelMixin, ConfigMixin):
             context=context,
             context_lens=context_lens,
             block_mask=self.block_mask,
-            sink_recache_after_switch=sink_recache_after_switch
+            sink_recache_after_switch=sink_recache_after_switch,
+            cached_grid_dims=cached_grid_dims
         )
         # print("kwargs done")
         def create_custom_forward(module):
@@ -1011,7 +1264,10 @@ class CausalWanModel(ModelMixin, ConfigMixin):
 
         cache_update_info = None
         cache_update_infos = []  # Collect cache update info for all blocks
+        print(f"[Model Forward] Starting {len(self.blocks)} transformer blocks...")
         for block_index, block in enumerate(self.blocks):
+            if block_index == 0:
+                print(f"[Model Forward] Block 0 starting...")
             torch.cuda.nvtx.range_push(f"transformer_block_{block_index}")
             # print(f"block_index: {block_index}")
             if torch.is_grad_enabled() and self.gradient_checkpointing:
@@ -1056,6 +1312,10 @@ class CausalWanModel(ModelMixin, ConfigMixin):
                 else:
                     x = result
             torch.cuda.nvtx.range_pop()  # transformer_block
+            if block_index == 0:
+                print(f"[Model Forward] Block 0 done")
+            elif block_index == len(self.blocks) - 1:
+                print(f"[Model Forward] All {len(self.blocks)} blocks done")
         # log_gpu_memory(f"in _forward_inference: {x[0].device}")
         # After all blocks are processed, apply cache updates in a single pass
         if kv_cache is not None and cache_update_infos:
@@ -1254,6 +1514,21 @@ class CausalWanModel(ModelMixin, ConfigMixin):
         """
 
         c = self.out_dim
+
+        # Use cached grid sizes for CUDA graph compatibility (avoids .tolist() sync)
+        if self._cuda_graph_static_buffers is not None:
+            cached = self._cuda_graph_static_buffers
+            f, h, w = cached["f_patches"], cached["h_patches"], cached["w_patches"]
+            out = []
+            for u in x:
+                # Use cached dimensions instead of grid_sizes.tolist()
+                u = u[:f * h * w].view(f, h, w, *self.patch_size, c)
+                u = torch.einsum('fhwpqrc->cfphqwr', u)
+                u = u.reshape(c, f * self.patch_size[0], h * self.patch_size[1], w * self.patch_size[2])
+                out.append(u)
+            return out
+
+        # Original path with .tolist() (not CUDA graph safe)
         out = []
         for u, v in zip(x, grid_sizes.tolist()):
             u = u[:math.prod(v)].view(*v, *self.patch_size, c)

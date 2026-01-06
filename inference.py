@@ -209,6 +209,7 @@ for i, batch_data in tqdm(enumerate(dataloader), disable=(local_rank != 0)):
         return_latents=True,
         low_memory=low_memory,
         profile=getattr(config, "profile", False),
+        use_cuda_graph=getattr(config, "use_cuda_graphs", False),
     )
     current_video = rearrange(video, 'b t c h w -> b t h w c').cpu()
     all_video.append(current_video)

@@ -145,6 +145,12 @@ class WanDiffusionWrapper(torch.nn.Module):
 
         # self.seq_len = 1560 * local_attn_size if local_attn_size != -1 else 32760 # [1, 21, 16, 60, 104]
         self.seq_len = 1560 * local_attn_size if local_attn_size > 21 else 32760 # [1, 21, 16, 60, 104]
+
+        # Pre-cache scheduler tensors for CUDA graph compatibility
+        # These will be moved to GPU on first use and cached
+        self._scheduler_sigmas_cache = None
+        self._scheduler_timesteps_cache = None
+
         self.post_init()
 
     def enable_gradient_checkpointing(self) -> None:
@@ -172,6 +178,18 @@ class WanDiffusionWrapper(torch.nn.Module):
         self._gan_ca_blocks.requires_grad_(True)
         # self.has_cls_branch = True
 
+    def _get_scheduler_tensors(self, device: torch.device):
+        """
+        Get scheduler sigmas and timesteps tensors on the specified device.
+
+        CUDA Graph Compatible: Tensors are cached to avoid device transfers
+        during graph capture.
+        """
+        if self._scheduler_sigmas_cache is None or self._scheduler_sigmas_cache.device != device:
+            self._scheduler_sigmas_cache = self.scheduler.sigmas.double().to(device)
+            self._scheduler_timesteps_cache = self.scheduler.timesteps.double().to(device)
+        return self._scheduler_sigmas_cache, self._scheduler_timesteps_cache
+
     def _convert_flow_pred_to_x0(self, flow_pred: torch.Tensor, xt: torch.Tensor, timestep: torch.Tensor) -> torch.Tensor:
         """
         Convert flow matching's prediction to x0 prediction.
@@ -186,11 +204,14 @@ class WanDiffusionWrapper(torch.nn.Module):
         """
         # use higher precision for calculations
         original_dtype = flow_pred.dtype
-        flow_pred, xt, sigmas, timesteps = map(
-            lambda x: x.double().to(flow_pred.device), [flow_pred, xt,
-                                                        self.scheduler.sigmas,
-                                                        self.scheduler.timesteps]
-        )
+        device = flow_pred.device
+
+        # Get cached scheduler tensors (CUDA graph compatible)
+        sigmas, timesteps = self._get_scheduler_tensors(device)
+
+        # Convert input tensors to double (no device transfer needed)
+        flow_pred = flow_pred.double()
+        xt = xt.double()
 
         timestep_id = torch.argmin(
             (timesteps.unsqueeze(0) - timestep.unsqueeze(1)).abs(), dim=1)

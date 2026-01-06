@@ -1,5 +1,6 @@
 # Architecture
 profile: true
+use_cuda_graphs: true
 denoising_step_list:
 - 1000
 - 750
@@ -9,9 +10,9 @@ warp_denoising_step: true # need to remove - 0 in denoising_step_list if warp_de
 num_frame_per_block: 3
 model_name: Wan2.1-T2V-1.3B
 model_kwargs:
-  local_attn_size: 12
+  local_attn_size: 10
   timestep_shift: 5.0
-  sink_size: 3
+  sink_size: 1
 
 
 # Inference

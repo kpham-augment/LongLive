@@ -1,4 +1,5 @@
 profile: true
+use_cuda_graphs: false
 denoising_step_list:
 - 1000
 - 750

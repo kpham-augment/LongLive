@@ -1,14 +1,13 @@
 # Adopted from https://github.com/guandeh17/Self-Forcing
 # SPDX-License-Identifier: Apache-2.0
-from typing import List, Optional
+from typing import List
 import torch
-import os
+import torch.distributed as dist
 
 from utils.wan_wrapper import WanDiffusionWrapper, WanTextEncoder, WanVAEWrapper
-
-from utils.memory import gpu, get_cuda_free_memory_gb, DynamicSwapInstaller, move_model_to_device_with_memory_preservation, log_gpu_memory
+from utils.memory import gpu, get_cuda_free_memory_gb, move_model_to_device_with_memory_preservation
 from utils.debug_option import DEBUG
-import torch.distributed as dist
+from wan.modules.causal_model import is_ring_buffer_cache
 
 class CausalInferencePipeline(torch.nn.Module):
     def __init__(
@@ -45,6 +44,11 @@ class CausalInferencePipeline(torch.nn.Module):
         self.num_frame_per_block = getattr(args, "num_frame_per_block", 1)
         self.local_attn_size = args.model_kwargs.local_attn_size
 
+        # CUDA Graph support - stores graphs keyed by (batch_size, num_frames, current_start)
+        self._cuda_graphs: dict = {}
+        self._cuda_graph_static_inputs: dict = {}
+        self._cuda_graph_static_outputs: dict = {}
+
         # Normalize to list if sequence-like (e.g., OmegaConf ListConfig)
 
         if not dist.is_initialized() or dist.get_rank() == 0:
@@ -53,6 +57,205 @@ class CausalInferencePipeline(torch.nn.Module):
         if self.num_frame_per_block > 1:
             self.generator.model.num_frame_per_block = self.num_frame_per_block
 
+    def _get_cuda_graph_key(self, batch_size: int, num_frames: int, current_start: int) -> tuple:
+        """Generate a key for CUDA graph caching."""
+        return (batch_size, num_frames, current_start)
+
+    def clear_cuda_graphs(self) -> None:
+        """Clear all cached CUDA graphs to free memory."""
+        self._cuda_graphs.clear()
+        self._cuda_graph_static_inputs.clear()
+        self._cuda_graph_static_outputs.clear()
+
+    def _run_generator_with_cuda_graph(
+        self,
+        noisy_input: torch.Tensor,
+        conditional_dict: dict,
+        timestep: torch.Tensor,
+        current_start: int,
+        warmup: bool = False,
+    ) -> torch.Tensor:
+        """
+        Run the generator forward pass with CUDA graph capture/replay.
+
+        Args:
+            noisy_input: Input tensor of shape (batch_size, num_frames, C, H, W)
+            conditional_dict: Conditioning dictionary
+            timestep: Timestep tensor
+            current_start: Current start position in tokens
+            warmup: If True, run warmup iterations before capture
+
+        Returns:
+            denoised_pred: Denoised prediction tensor
+
+        Raises:
+            RuntimeError: If KV cache is not a ring buffer cache. CUDA graphs require
+                ring buffer cache to avoid .item() calls and variable tensor slicing.
+        """
+        # Validate that ring buffer cache is used - required for CUDA graph compatibility
+        if self.kv_cache1 is not None:
+            for block_idx, cache in enumerate(self.kv_cache1):
+                if not is_ring_buffer_cache(cache):
+                    raise RuntimeError(
+                        f"CUDA graphs require ring buffer cache, but block {block_idx} has legacy cache. "
+                        f"Use use_ring_buffer=True in _initialize_kv_cache() or disable CUDA graphs."
+                    )
+
+        batch_size, num_frames = noisy_input.shape[:2]
+        graph_key = self._get_cuda_graph_key(batch_size, num_frames, current_start)
+
+        import time
+        if graph_key not in self._cuda_graphs:
+            # First time seeing this configuration - capture the graph
+            print(f"[CUDA Graph] New graph_key={graph_key}, will capture...")
+
+            # Initialize cu_seqlens_q for all KV cache blocks (once, before graph capture)
+            # Query length = num_frames * frame_seq_length
+            query_len = num_frames * self.frame_seq_length
+            from wan.modules.ring_buffer_cache import initialize_cu_seqlens_q
+            for cache in self.kv_cache1:
+                initialize_cu_seqlens_q(cache, query_len)
+
+            # Setup CUDA graph static buffers in the model to avoid dynamic tensor creation
+            # noisy_input shape: [batch, num_frames, C, H, W]
+            _, _, c, h, w = noisy_input.shape
+            self.generator.model.setup_cuda_graph_buffers(
+                batch_size=batch_size,
+                num_frames=num_frames,
+                height=h,
+                width=w,
+                device=noisy_input.device
+            )
+
+            if warmup:
+                # Warmup run to ensure CUDA is ready
+                # NOTE: First warmup triggers torch.compile for FlexAttention which can take MINUTES
+                # IMPORTANT: Warmup must occur on a side stream per PyTorch CUDA graph docs
+                print(f"[CUDA Graph] Running warmup (first run triggers torch.compile, may take minutes)...")
+                t0 = time.time()
+
+                # Create a side stream for warmup
+                warmup_stream = torch.cuda.Stream()
+                warmup_stream.wait_stream(torch.cuda.current_stream())
+
+                with torch.cuda.stream(warmup_stream):
+                    with torch.no_grad():
+                        _ = self.generator(
+                            noisy_image_or_video=noisy_input,
+                            conditional_dict=conditional_dict,
+                            timestep=timestep,
+                            kv_cache=self.kv_cache1,
+                            crossattn_cache=self.crossattn_cache,
+                            current_start=current_start,
+                        )
+
+                # Wait for warmup to complete before capture
+                torch.cuda.current_stream().wait_stream(warmup_stream)
+                torch.cuda.synchronize()
+                print(f"[CUDA Graph] Warmup done in {time.time() - t0:.2f}s")
+
+                # Reset caches after warmup but before capture to ensure consistent state
+                # The graph will capture fresh cache writes starting from current_start
+                from wan.modules.ring_buffer_cache import reset_ring_buffer_cache
+                for cache in self.kv_cache1:
+                    reset_ring_buffer_cache(cache, preserve_sink=False)
+                for cache in self.crossattn_cache:
+                    if isinstance(cache, dict) and "is_init" in cache:
+                        cache["is_init"] = False
+                print(f"[CUDA Graph] Caches reset for capture")
+
+            # Create static input buffers
+            static_noisy_input = noisy_input.clone()
+            static_timestep = timestep.clone()
+            static_conditional_dict = {
+                k: v.clone() if isinstance(v, torch.Tensor) else v
+                for k, v in conditional_dict.items()
+            }
+
+            # Capture the graph using a private memory pool to avoid memory conflicts
+            # This is recommended by PyTorch for CUDA graph capture
+            print(f"[CUDA Graph] Capturing graph...")
+            t0 = time.time()
+            cuda_graph = torch.cuda.CUDAGraph()
+
+            # Use a private memory pool for the graph to avoid memory conflicts
+            # The pool_id ensures the graph's memory allocations don't interfere with other operations
+            mempool = torch.cuda.graph_pool_handle()
+
+            with torch.cuda.graph(cuda_graph, pool=mempool):
+                _, static_denoised_pred = self.generator(
+                    noisy_image_or_video=static_noisy_input,
+                    conditional_dict=static_conditional_dict,
+                    timestep=static_timestep,
+                    kv_cache=self.kv_cache1,
+                    crossattn_cache=self.crossattn_cache,
+                    current_start=current_start,
+                )
+            print(f"[CUDA Graph] Capture complete for graph_key={graph_key} in {time.time() - t0:.2f}s")
+
+            # Store the graph and static buffers
+            self._cuda_graphs[graph_key] = cuda_graph
+            self._cuda_graph_static_inputs[graph_key] = {
+                "noisy_input": static_noisy_input,
+                "timestep": static_timestep,
+                "conditional_dict": static_conditional_dict,
+            }
+            self._cuda_graph_static_outputs[graph_key] = static_denoised_pred
+
+            # Debug: Store original cache tensor addresses for verification during replay
+            self._debug_cache_ptrs = {}
+            for i, cache in enumerate(self.kv_cache1[:1]):  # Check first cache only
+                for key in ['k', 'v', 'k_lens_padded', 'cu_seqlens_k', 'cu_seqlens_q']:
+                    if key in cache:
+                        self._debug_cache_ptrs[f"{i}_{key}"] = cache[key].data_ptr()
+                        print(f"[CUDA Graph] Captured cache[{i}][{key}] at ptr={cache[key].data_ptr()}")
+
+            return static_denoised_pred.clone()
+        else:
+            # Replay the captured graph
+            print(f"[CUDA Graph] Replaying graph_key={graph_key}")
+            static_inputs = self._cuda_graph_static_inputs[graph_key]
+
+            # Debug: Check if cache tensor addresses are stable
+            if hasattr(self, '_debug_cache_ptrs'):
+                for i, cache in enumerate(self.kv_cache1[:1]):  # Check first cache only
+                    for key in ['k', 'v', 'k_lens_padded', 'cu_seqlens_k', 'cu_seqlens_q']:
+                        if key in cache:
+                            current_ptr = cache[key].data_ptr()
+                            orig_ptr = self._debug_cache_ptrs.get(f"{i}_{key}")
+                            if orig_ptr and current_ptr != orig_ptr:
+                                print(f"[CUDA Graph] WARNING: Cache tensor {key} address changed! {orig_ptr} -> {current_ptr}")
+
+            # Reset caches to match state at capture time
+            from wan.modules.ring_buffer_cache import reset_ring_buffer_cache
+            for cache in self.kv_cache1:
+                reset_ring_buffer_cache(cache, preserve_sink=False)
+            for cache in self.crossattn_cache:
+                if isinstance(cache, dict) and "is_init" in cache:
+                    cache["is_init"] = False
+
+            # Copy new data into static buffers
+            static_inputs["noisy_input"].copy_(noisy_input)
+            static_inputs["timestep"].copy_(timestep)
+            for k, v in conditional_dict.items():
+                if isinstance(v, torch.Tensor):
+                    static_inputs["conditional_dict"][k].copy_(v)
+
+            # Replay the graph
+            print(f"[CUDA Graph] About to replay graph...")
+            torch.cuda.synchronize()
+            print(f"[CUDA Graph] Synchronized before replay")
+            try:
+                self._cuda_graphs[graph_key].replay()
+                print(f"[CUDA Graph] Replay completed successfully")
+            except Exception as e:
+                print(f"[CUDA Graph] Replay failed with exception: {e}")
+                raise
+            torch.cuda.synchronize()
+            print(f"[CUDA Graph] Synchronized after replay")
+
+            return self._cuda_graph_static_outputs[graph_key].clone()
+
     def inference(
         self,
         noise: torch.Tensor,
@@ -60,6 +263,7 @@ class CausalInferencePipeline(torch.nn.Module):
         return_latents: bool = False,
         profile: bool = False,
         low_memory: bool = False,
+        use_cuda_graph: bool = False,
     ) -> torch.Tensor:
         """
         Perform inference on the given noise and text prompts.
@@ -68,6 +272,8 @@ class CausalInferencePipeline(torch.nn.Module):
                 (batch_size, num_output_frames, num_channels, height, width).
             text_prompts (List[str]): The list of text prompts.
             return_latents (bool): Whether to return the latents.
+            use_cuda_graph (bool): If True, use CUDA graphs to reduce CPU overhead.
+                Requires static shapes and ring buffer cache. Default: False.
         Outputs:
             video (torch.Tensor): The generated video tensor of shape
                 (batch_size, num_output_frames, num_channels, height, width).
@@ -123,7 +329,8 @@ class CausalInferencePipeline(torch.nn.Module):
             batch_size=batch_size,
             dtype=noise.dtype,
             device=noise.device,
-            kv_cache_size_override=kv_cache_size
+            kv_cache_size_override=kv_cache_size,
+            use_ring_buffer=True,  # Use ring buffer for CUDA graph compatibility
         )
         self._initialize_crossattn_cache(
             batch_size=batch_size,
@@ -143,17 +350,17 @@ class CausalInferencePipeline(torch.nn.Module):
 
         # Step 2: Temporal denoising loop
         all_num_frames = [self.num_frame_per_block] * num_blocks
-        for current_num_frames in all_num_frames:
+
+        for block_idx, current_num_frames in enumerate(all_num_frames):
             if profile:
                 block_start.record()
 
             noisy_input = noise[
                 :, current_start_frame:current_start_frame + current_num_frames]
+            current_start_tokens = current_start_frame * self.frame_seq_length
 
             # Step 2.1: Spatial denoising loop
             for index, current_timestep in enumerate(self.denoising_step_list):
-                # print(f"current_timestep: {current_timestep}")
-
                 # set current timestep
                 timestep = torch.ones(
                     [batch_size, current_num_frames],
@@ -161,14 +368,24 @@ class CausalInferencePipeline(torch.nn.Module):
                     dtype=torch.int64) * current_timestep
 
                 if index < len(self.denoising_step_list) - 1:
-                    _, denoised_pred = self.generator(
-                        noisy_image_or_video=noisy_input,
-                        conditional_dict=conditional_dict,
-                        timestep=timestep,
-                        kv_cache=self.kv_cache1,
-                        crossattn_cache=self.crossattn_cache,
-                        current_start=current_start_frame * self.frame_seq_length
-                    )
+                    if use_cuda_graph:
+                        # Use CUDA graph for the generator forward pass
+                        denoised_pred = self._run_generator_with_cuda_graph(
+                            noisy_input=noisy_input,
+                            conditional_dict=conditional_dict,
+                            timestep=timestep,
+                            current_start=current_start_tokens,
+                            warmup=(block_idx == 0 and index == 0),
+                        )
+                    else:
+                        _, denoised_pred = self.generator(
+                            noisy_image_or_video=noisy_input,
+                            conditional_dict=conditional_dict,
+                            timestep=timestep,
+                            kv_cache=self.kv_cache1,
+                            crossattn_cache=self.crossattn_cache,
+                            current_start=current_start_tokens
+                        )
                     next_timestep = self.denoising_step_list[index + 1]
                     noisy_input = self.scheduler.add_noise(
                         denoised_pred.flatten(0, 1),
@@ -178,26 +395,45 @@ class CausalInferencePipeline(torch.nn.Module):
                     ).unflatten(0, denoised_pred.shape[:2])
                 else:
                     # for getting real output
-                    _, denoised_pred = self.generator(
-                        noisy_image_or_video=noisy_input,
-                        conditional_dict=conditional_dict,
-                        timestep=timestep,
-                        kv_cache=self.kv_cache1,
-                        crossattn_cache=self.crossattn_cache,
-                        current_start=current_start_frame * self.frame_seq_length
-                    )
+                    if use_cuda_graph:
+                        denoised_pred = self._run_generator_with_cuda_graph(
+                            noisy_input=noisy_input,
+                            conditional_dict=conditional_dict,
+                            timestep=timestep,
+                            current_start=current_start_tokens,
+                            warmup=False,
+                        )
+                    else:
+                        _, denoised_pred = self.generator(
+                            noisy_image_or_video=noisy_input,
+                            conditional_dict=conditional_dict,
+                            timestep=timestep,
+                            kv_cache=self.kv_cache1,
+                            crossattn_cache=self.crossattn_cache,
+                            current_start=current_start_tokens
+                        )
             # Step 2.2: record the model's output
             output[:, current_start_frame:current_start_frame + current_num_frames] = denoised_pred.to(output.device)
             # Step 2.3: rerun with timestep zero to update KV cache using clean context
             context_timestep = torch.ones_like(timestep) * self.args.context_noise
-            self.generator(
-                noisy_image_or_video=denoised_pred,
-                conditional_dict=conditional_dict,
-                timestep=context_timestep,
-                kv_cache=self.kv_cache1,
-                crossattn_cache=self.crossattn_cache,
-                current_start=current_start_frame * self.frame_seq_length,
-            )
+            if use_cuda_graph:
+                # Use CUDA graph for the context update pass
+                _ = self._run_generator_with_cuda_graph(
+                    noisy_input=denoised_pred,
+                    conditional_dict=conditional_dict,
+                    timestep=context_timestep,
+                    current_start=current_start_tokens,
+                    warmup=False,
+                )
+            else:
+                self.generator(
+                    noisy_image_or_video=denoised_pred,
+                    conditional_dict=conditional_dict,
+                    timestep=context_timestep,
+                    kv_cache=self.kv_cache1,
+                    crossattn_cache=self.crossattn_cache,
+                    current_start=current_start_tokens,
+                )
 
             if profile:
                 block_end.record()
@@ -252,11 +488,18 @@ class CausalInferencePipeline(torch.nn.Module):
         else:
             return video
 
-    def _initialize_kv_cache(self, batch_size, dtype, device, kv_cache_size_override: int | None = None):
+    def _initialize_kv_cache(self, batch_size, dtype, device, kv_cache_size_override: int | None = None, use_ring_buffer: bool = True):
         """
         Initialize a Per-GPU KV cache for the Wan model.
+
+        Args:
+            batch_size: Batch size for the cache
+            dtype: Data type for K/V tensors
+            device: Device to allocate on
+            kv_cache_size_override: Override for cache size (if None, computed from local_attn_size)
+            use_ring_buffer: If True (default), use ring buffer cache for CUDA graph compatibility.
+                            If False, use legacy clone-based cache.
         """
-        kv_cache1 = []
         # Determine cache size
         if kv_cache_size_override is not None:
             kv_cache_size = kv_cache_size_override
@@ -268,15 +511,44 @@ class CausalInferencePipeline(torch.nn.Module):
                 # Global attention: default cache for 21 frames (backward compatibility)
                 kv_cache_size = 32760
 
-        for _ in range(self.num_transformer_blocks):
-            kv_cache1.append({
-                "k": torch.zeros([batch_size, kv_cache_size, 12, 128], dtype=dtype, device=device),
-                "v": torch.zeros([batch_size, kv_cache_size, 12, 128], dtype=dtype, device=device),
-                "global_end_index": torch.tensor([0], dtype=torch.long, device=device),
-                "local_end_index": torch.tensor([0], dtype=torch.long, device=device)
-            })
+        # Get sink_size from model (defaults to 0 if not set)
+        sink_size = getattr(self.generator.model, 'sink_size', 0)
+        if hasattr(self.generator.model, 'config') and hasattr(self.generator.model.config, 'sink_size'):
+            sink_size = self.generator.model.config.sink_size
+        sink_tokens = sink_size * self.frame_seq_length
+
+        kv_cache1 = []
+
+        if use_ring_buffer:
+            # Use new ring buffer cache for CUDA graph compatibility
+            from wan.modules.ring_buffer_cache import create_ring_buffer_cache
+
+            # Wan 1.3B model: 12 heads, 128 dim per head
+            num_heads = 12
+            head_dim = 128
+
+            for _ in range(self.num_transformer_blocks):
+                kv_cache1.append(create_ring_buffer_cache(
+                    batch_size=batch_size,
+                    buffer_size=kv_cache_size,
+                    num_heads=num_heads,
+                    head_dim=head_dim,
+                    sink_tokens=sink_tokens,
+                    dtype=dtype,
+                    device=device,
+                ))
+        else:
+            # Legacy cache structure (backward compatible)
+            for _ in range(self.num_transformer_blocks):
+                kv_cache1.append({
+                    "k": torch.zeros([batch_size, kv_cache_size, 12, 128], dtype=dtype, device=device),
+                    "v": torch.zeros([batch_size, kv_cache_size, 12, 128], dtype=dtype, device=device),
+                    "global_end_index": torch.tensor([0], dtype=torch.long, device=device),
+                    "local_end_index": torch.tensor([0], dtype=torch.long, device=device)
+                })
 
         self.kv_cache1 = kv_cache1  # always store the clean cache
+        self._use_ring_buffer_cache = use_ring_buffer
 
     def _initialize_crossattn_cache(self, batch_size, dtype, device):
         """

@@ -3,3 +3,4 @@ longlive_models
 wan_models
 videos
 flash-attention/
+*.nsys-rep

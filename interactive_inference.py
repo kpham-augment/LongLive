@@ -202,6 +202,7 @@ for i, batch_data in tqdm(enumerate(dataloader), disable=(local_rank != 0), desc
         switch_frame_indices=switch_frame_indices,
         return_latents=False,
         profile=getattr(config, "profile", False),
+        use_cuda_graph=getattr(config, "use_cuda_graphs", False),
     )
     torch.cuda.profiler.stop()
     

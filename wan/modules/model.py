@@ -12,15 +12,33 @@ from .attention import flash_attention
 __all__ = ['WanModel']
 
 
+# Cache for sinusoidal embedding frequency tensors (for CUDA graph compatibility)
+_sinusoidal_freq_cache: dict = {}
+
+
 def sinusoidal_embedding_1d(dim, position):
+    """
+    Generate 1D sinusoidal positional embeddings.
+
+    CUDA Graph Compatible: Frequency tensors are cached to avoid creating
+    new tensors during graph capture.
+    """
     # preprocess
     assert dim % 2 == 0
     half = dim // 2
     position = position.type(torch.float64)
 
+    # Get or create cached frequency tensor for this dim/device combination
+    device = position.device
+    cache_key = (dim, device)
+    if cache_key not in _sinusoidal_freq_cache:
+        # Create frequency tensor: 10000^(-[0, 1, ..., half-1] / half)
+        freq = torch.pow(10000, -torch.arange(half, device=device, dtype=torch.float64).div(half))
+        _sinusoidal_freq_cache[cache_key] = freq
+    freq = _sinusoidal_freq_cache[cache_key]
+
     # calculation
-    sinusoid = torch.outer(
-        position, torch.pow(10000, -torch.arange(half).to(position).div(half)))
+    sinusoid = torch.outer(position, freq)
     x = torch.cat([torch.cos(sinusoid), torch.sin(sinusoid)], dim=1)
     return x
 

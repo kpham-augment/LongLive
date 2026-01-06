@@ -7,13 +7,12 @@
 # No warranties are given. The work is provided "AS IS", without warranty of any kind, express or implied.
 #
 # SPDX-License-Identifier: Apache-2.0
-from typing import List, Optional
+from typing import List
 import torch
 
 from utils.wan_wrapper import WanDiffusionWrapper, WanTextEncoder, WanVAEWrapper
 from utils.memory import gpu, get_cuda_free_memory_gb, move_model_to_device_with_memory_preservation
 from pipeline.causal_inference import CausalInferencePipeline
-import torch.distributed as dist
 from utils.debug_option import DEBUG
 
 
@@ -38,10 +37,24 @@ class InteractiveCausalInferencePipeline(CausalInferencePipeline):
             torch.cuda.nvtx.range_push("kv_cache_reset")
             for block_idx in range(self.num_transformer_blocks):
                 cache = self.kv_cache1[block_idx]
-                cache["k"].zero_()
-                cache["v"].zero_()
-                # cache["global_end_index"].zero_()
-                # cache["local_end_index"].zero_()
+                # Check if using ring buffer cache
+                if "write_ptr" in cache:
+                    from wan.modules.ring_buffer_cache import reset_ring_buffer_cache
+                    reset_ring_buffer_cache(cache, preserve_sink=False)
+                else:
+                    cache["k"].zero_()
+                    cache["v"].zero_()
+                    # cache["global_end_index"].zero_()
+                    # cache["local_end_index"].zero_()
+            torch.cuda.nvtx.range_pop()
+        else:
+            # global_sink=True: preserve sink tokens, reset only rolling window
+            torch.cuda.nvtx.range_push("kv_cache_reset_preserve_sink")
+            for block_idx in range(self.num_transformer_blocks):
+                cache = self.kv_cache1[block_idx]
+                if "write_ptr" in cache:
+                    from wan.modules.ring_buffer_cache import reset_ring_buffer_cache
+                    reset_ring_buffer_cache(cache, preserve_sink=True)
             torch.cuda.nvtx.range_pop()
 
         # reset cross-attention cache
@@ -114,6 +127,7 @@ class InteractiveCausalInferencePipeline(CausalInferencePipeline):
         return_latents: bool = False,
         low_memory: bool = False,
         profile: bool = False,
+        use_cuda_graph: bool = False,
     ):
         """Generate a video and switch prompts at specified frame indices.
 
@@ -125,6 +139,8 @@ class InteractiveCausalInferencePipeline(CausalInferencePipeline):
             return_latents: Whether to also return the latent tensor.
             low_memory: Enable low-memory mode.
             profile: Whether to enable profiling and print timing information.
+            use_cuda_graph: If True, use CUDA graphs to reduce CPU overhead.
+                Requires static shapes and ring buffer cache. Default: False.
         """
         batch_size, num_output_frames, num_channels, height, width = noise.shape
         assert len(text_prompts_list) >= 1, "text_prompts_list must not be empty"
@@ -266,6 +282,7 @@ class InteractiveCausalInferencePipeline(CausalInferencePipeline):
             noisy_input = noise[
                 :, current_start_frame : current_start_frame + current_num_frames
             ]
+            current_start_tokens = current_start_frame * self.frame_seq_length
 
             # ---------------- Spatial denoising loop ----------------
             torch.cuda.nvtx.range_push("spatial_denoising_loop")
@@ -280,14 +297,23 @@ class InteractiveCausalInferencePipeline(CausalInferencePipeline):
 
                 if index < len(self.denoising_step_list) - 1:
                     torch.cuda.nvtx.range_push("generator_forward")
-                    _, denoised_pred = self.generator(
-                        noisy_image_or_video=noisy_input,
-                        conditional_dict=cond_in_use,
-                        timestep=timestep,
-                        kv_cache=self.kv_cache1,
-                        crossattn_cache=self.crossattn_cache,
-                        current_start=current_start_frame * self.frame_seq_length,
-                    )
+                    if use_cuda_graph:
+                        denoised_pred = self._run_generator_with_cuda_graph(
+                            noisy_input=noisy_input,
+                            conditional_dict=cond_in_use,
+                            timestep=timestep,
+                            current_start=current_start_tokens,
+                            warmup=(block_idx == 0 and index == 0),
+                        )
+                    else:
+                        _, denoised_pred = self.generator(
+                            noisy_image_or_video=noisy_input,
+                            conditional_dict=cond_in_use,
+                            timestep=timestep,
+                            kv_cache=self.kv_cache1,
+                            crossattn_cache=self.crossattn_cache,
+                            current_start=current_start_tokens,
+                        )
                     torch.cuda.nvtx.range_pop()
                     torch.cuda.nvtx.range_push("add_noise")
                     next_timestep = self.denoising_step_list[index + 1]
@@ -302,14 +328,23 @@ class InteractiveCausalInferencePipeline(CausalInferencePipeline):
                     torch.cuda.nvtx.range_pop()
                 else:
                     torch.cuda.nvtx.range_push("generator_forward")
-                    _, denoised_pred = self.generator(
-                        noisy_image_or_video=noisy_input,
-                        conditional_dict=cond_in_use,
-                        timestep=timestep,
-                        kv_cache=self.kv_cache1,
-                        crossattn_cache=self.crossattn_cache,
-                        current_start=current_start_frame * self.frame_seq_length,
-                    )
+                    if use_cuda_graph:
+                        denoised_pred = self._run_generator_with_cuda_graph(
+                            noisy_input=noisy_input,
+                            conditional_dict=cond_in_use,
+                            timestep=timestep,
+                            current_start=current_start_tokens,
+                            warmup=False,
+                        )
+                    else:
+                        _, denoised_pred = self.generator(
+                            noisy_image_or_video=noisy_input,
+                            conditional_dict=cond_in_use,
+                            timestep=timestep,
+                            kv_cache=self.kv_cache1,
+                            crossattn_cache=self.crossattn_cache,
+                            current_start=current_start_tokens,
+                        )
                     torch.cuda.nvtx.range_pop()
                 torch.cuda.nvtx.range_pop()  # denoising_step
             torch.cuda.nvtx.range_pop()  # spatial_denoising_loop
@@ -320,14 +355,23 @@ class InteractiveCausalInferencePipeline(CausalInferencePipeline):
             # rerun with clean context to update cache
             torch.cuda.nvtx.range_push("clean_context_cache_update")
             context_timestep = torch.ones_like(timestep) * self.args.context_noise
-            self.generator(
-                noisy_image_or_video=denoised_pred,
-                conditional_dict=cond_in_use,
-                timestep=context_timestep,
-                kv_cache=self.kv_cache1,
-                crossattn_cache=self.crossattn_cache,
-                current_start=current_start_frame * self.frame_seq_length,
-            )
+            if use_cuda_graph:
+                _ = self._run_generator_with_cuda_graph(
+                    noisy_input=denoised_pred,
+                    conditional_dict=cond_in_use,
+                    timestep=context_timestep,
+                    current_start=current_start_tokens,
+                    warmup=False,
+                )
+            else:
+                self.generator(
+                    noisy_image_or_video=denoised_pred,
+                    conditional_dict=cond_in_use,
+                    timestep=context_timestep,
+                    kv_cache=self.kv_cache1,
+                    crossattn_cache=self.crossattn_cache,
+                    current_start=current_start_tokens,
+                )
             torch.cuda.nvtx.range_pop()
 
             if profile:
